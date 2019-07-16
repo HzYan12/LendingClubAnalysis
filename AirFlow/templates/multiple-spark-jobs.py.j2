@@ -1,0 +1,152 @@
+# rendered - {{ self._TemplateReference__context.name }}
+
+{% include '_py_imports.j2' %}
+{% include '_airflow_imports.j2' %}
+
+from airflow.operators.sensors import S3KeySensor
+
+dag_name = '{{ dag_name }}'.strip()
+
+def push_cluster_name(**kwargs):
+    ti = kwargs['ti']
+    cluster_name = dag_name[:27] + '-' + str(int(round(time() * 100))) + '-reg'
+    ti.xcom_push(key='cluster_name', value=cluster_name)
+
+with DAG(dag_id=dag_name,
+         schedule_interval='{{ schedule_interval }}',
+         start_date=datetime.strptime('{{ start_date }}', "%Y-%m-%d %H:%M:%S"),
+         {% if end_date %}
+         end_date=datetime.strptime('{{ end_date }}', "%Y-%m-%d %H:%M:%S"),
+         {% endif %}
+         max_active_runs={{ max_active_runs }},
+         concurrency={{ concurrency }},
+         default_args={'project_id': dataproc.get("project_id"), 'email': '{{ email }}', 'email_on_failure': {% if email_on_failure %}{{email_on_failure}}{% else%}False{% endif %}, 'email_on_retry': {% if email_on_retry %}{{email_on_retry}}{% else %}False{% endif %}}) as dag:
+
+    push_cluster_name = PythonOperator(dag=dag, task_id="push-cluster-name", provide_context=True, python_callable=push_cluster_name)
+
+    {% for dataproc in list_of_dataprocs %}
+    {{ dataproc.creation_operator_name }} = DataprocClusterCreateOperator(
+        task_id='{{ dataproc.creation_operator_name }}',
+        project_id=dataproc.get('project_id'),
+        cluster_name='{% raw %}{{ ti.xcom_pull(key="cluster_name", task_ids="push-cluster-name") }}{% endraw %}' + '{{ dataproc.id }}',
+        storage_bucket=dataproc.get("storage_bucket"),
+        zone=random.choice([ "%s-%s" % (dataproc.get("region"), zone_suffix) for zone_suffix in ["a", "b", "c", "d", "f"]]),
+        master_machine_type='{{ dataproc.master_machine_type }}',
+        worker_machine_type='{{ dataproc.worker_machine_type }}',
+        metadata={"ssh-keys": "%s:%s" % (dataproc.get("ssh_user"), dataproc.get("ssh_key"))},
+        num_workers={{ dataproc.num_workers }},
+        execution_timeout=timedelta(minutes=30),
+        properties={
+            {% if dataproc.s3_access_enabled %}
+                "core:fs.s3a.access.key": dataproc.get("aws_access_key_id"),
+                "core:fs.s3a.secret.key": dataproc.get("aws_secret_access_key"),
+            {% endif %}
+            {% if dataproc.yarn_dominant_resource_calculator %}
+                "capacity-scheduler:yarn.scheduler.capacity.resource-calculator": "org.apache.hadoop.yarn.util.resource.DominantResourceCalculator",
+            {% endif %}
+        },
+        image_version=dataproc.get("image_version"),
+        internal_ip_only=True,
+        service_account=dataproc.get("service_account"),
+        subnetwork_uri={% if private_subnetwork %} dataproc.get("private_subnetwork_uri"){% else %} dataproc.get("subnetwork_uri"){% endif %},
+        labels={'ads_product': 'data_engineering', 'business_unit': 'ads', 'dag': dag_name},
+        tags=['allow-private-ssh-' + dataproc.get("environment"), 'spark-dataproc'],
+        init_actions_uris={% if init_actions_uris %}{{init_actions_uris}}{% else %}None{% endif %})
+
+    {{ dataproc.creation_operator_name }}.set_upstream(push_cluster_name)
+
+    {{ dataproc.deletion_operator_name }} = DataprocClusterDeleteOperator(
+        task_id='{{ dataproc.deletion_operator_name }}',
+        project_id=dataproc.get('project_id'),
+        cluster_name='{% raw %}{{ ti.xcom_pull(key="cluster_name", task_ids="push-cluster-name") }}{% endraw %}' + '{{ dataproc.id }}',
+        execution_timeout=timedelta(minutes=30),
+        trigger_rule=trigger_rule.TriggerRule.ALL_DONE)
+    {% endfor %}
+
+    {% for job in list_of_jobs %}
+    args = {{ job.args }}
+    {{ job.name }} = DataProcSparkOperator(
+        task_id='{{ job.name }}',
+        dataproc_spark_jars=['{}/jars/{}'.format(dataproc.get("artifact_bucket"),'{{ job.jar }}')],
+        main_class='{{ job.main_class }}',
+        {% if dataproc_spark_properties %}
+        dataproc_spark_properties={{dataproc_spark_properties}},
+        {% endif %}
+        job_name=dag_name + '{{ job.name }}',
+        cluster_name='{% raw %}{{ ti.xcom_pull(key="cluster_name", task_ids="push-cluster-name") }}{% endraw %}' + '{{ job.dataproc_id }}',
+        execution_timeout= {{ job.timeout }},
+        arguments=args
+    )
+    {% endfor %}
+
+    {% if list_of_s3_sensors %}
+    {% for sensor in list_of_s3_sensors %}
+    {{ sensor.name }} = S3KeySensor(
+        bucket_name = '{}'.format(
+                {"test": "{{sensor.bucket_name.test}}",
+                 "stg": "{{sensor.bucket_name.stg}}",
+                 "prd": "{{sensor.bucket_name.prd}}"}.get(dataproc.get("environment"))),
+        aws_conn_id = 's3_default',
+        {% if (sensor.date and sensor.hour ) %}
+        bucket_key = '{{sensor.file_path}}/date=' + "{{sensor.date}}" + '/hour=' + "{{sensor.hour}}" + "/{{sensor.file_key}}",
+        {% elif sensor.date %}
+        bucket_key = '{{sensor.file_path}}/date=' + "{{sensor.date}}" + "/{{sensor.file_key}}",
+        {% else %}
+        bucket_key = "{{sensor.file_path}}/{{sensor.file_key}}",
+        {% endif %}
+        task_id='{{ sensor.name }}',
+        poke_interval={% if sensor.poke_interval %}{{sensor.poke_interval}}{% else %}30{% endif %},
+        timeout={% if sensor.timeout %}{{sensor.timeout}}{% else %}1800{% endif %}
+    )
+    {% endfor %}
+    {% endif %}
+
+    {% if list_of_gcs_24h_sensors %}
+    {% for sensor in list_of_gcs_24h_sensors %}
+    {{ sensor.name }} = GoogleCloudStorage24HourParquetSensor(
+        task_id='{{ sensor.name }}',
+        bucket={{ sensor.bucket }},
+        prefix='{{ sensor.file_path }}/date='+"{{ sensor.date }}",
+        google_cloud_conn_id='google_cloud_storage_default',
+        poke_interval={% if sensor.poke_interval %}{{sensor.poke_interval}}{% else %}30{% endif %},
+        timeout={% if sensor.timeout %}{{sensor.timeout}}{% else %}1800{% endif %}
+    )
+    {% endfor %}
+    {% endif %}
+
+    {% for job in list_of_jobs %}
+      {% if job.up_streams %}
+        {% for up_stream in job.up_streams %}
+    {{ job.name }}.set_upstream({{ up_stream }})
+        {% endfor %}
+      {% endif %}
+
+      {% if job.down_streams %}
+        {% for down_stream in job.down_streams %}
+    {{ job.name }}.set_downstream({{ down_stream }})
+        {% endfor %}
+      {% endif %}
+    {% endfor %}
+
+    {% for dataproc in list_of_dataprocs %}
+      {% if dataproc.creation_up_streams %}
+        {% for up_stream in dataproc.creation_up_streams %}
+    {{ dataproc.creation_operator_name }}.set_upstream({{ up_stream }})
+        {% endfor %}
+      {% endif %}
+      {% if dataproc.creation_down_stream %}
+        {% for down_stream in dataproc.creation_down_streams %}
+    {{ dataproc.creation_operator_name }}.set_downstream({{ down_stream }})
+        {% endfor %}
+      {% endif %}
+      {% if dataproc.deletion_up_streams %}
+        {% for up_stream in dataproc.deletion_up_streams %}
+    {{ dataproc.deletion_operator_name }}.set_upstream({{ up_stream }})
+        {% endfor %}
+      {% endif %}
+      {% if dataproc.deletion_down_streams %}
+        {% for down_stream in dataproc.deletion_down_streams %}
+    {{ dataproc.deletion_operator_name }}.set_downstream({{ down_stream }})
+        {% endfor %}
+      {% endif %}
+    {% endfor %}
