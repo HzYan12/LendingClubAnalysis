@@ -32,6 +32,7 @@ object LoanAnalyze extends Logging with LoanReader with RejectionReader with Loa
     // aggregate two datasets
     val aggregatedDf = loanInfoAggregator(rejectionDs, loanDs, spark)
 
+    // write aggregated data into files
     writeLoanAggregatedData(aggregatedDf, outputPath)
   }
 
