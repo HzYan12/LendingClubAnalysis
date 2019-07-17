@@ -1,0 +1,16 @@
+---
+-
+  dag_name: hzLendingClub
+  concurrency: 1
+  max_active_runs: 1
+  template: spark-job.py.j2
+  schedule_interval: "@daily"
+  start_date: 2019-03-26 00:00:00
+  job:
+    jar: gs://SparkProject-assembly-0.1.jar
+    main_class: com.hz.spark.LoanAnalyze
+    name: loan
+    args: |
+      ["gs:/LoanStats_2019Q1.csv",
+       "gs://RejectStats_2019Q1.csv",
+       "gs://output"]
