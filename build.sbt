@@ -1,4 +1,4 @@
-name := "SparkProject"
+name := "hzSparkProject"
 
 version := "0.1"
 
